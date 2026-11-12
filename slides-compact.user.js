@@ -1,23 +1,28 @@
 // ==UserScript==
 // @name         Google Slides – compact header + no Gemini nudge
 // @namespace    google-workspace-compact
-// @version      1.0.0
+// @version      1.1.0
 // @description  Moves File/Edit/View… onto the title row, and auto-dismisses the Gemini "Create a slide" / "Enhance this slide" nudge so the slide can use the full height.
 // @match        https://docs.google.com/presentation/*
 // @run-at       document-start
 // @grant        none
 // @license      MIT
 // ==/UserScript==
+// Skip if the Workspace Compact Chrome extension (or another copy) already ran.
+if (!window.__workspaceCompactLoaded) {
+window.__workspaceCompactLoaded = true;
 (function () {
+  // ---------- Styles ----------
+  // Everything that moves the menus is gated on the "wc-compact" class, so the
+  // script can fall back to Google's normal two-row header when the window is
+  // too narrow for the menus to fit beside the title.
   const style = document.createElement('style');
   style.textContent = `
-    /* Hide the Gemini nudge */
+    /* Hide the Gemini "Create a slide" / "Enhance this slide" nudge */
     .appsElementsGenerativeAiNudgeButtonNudgeRoot,
     #canvas-nudge-surface-soy-container,
     #canvas-nudge-surface { display: none !important; }
-
-    /* Put File / Edit / View… on the title row */
-    #docs-menubars {
+    html.wc-compact #docs-menubars {
       position: absolute !important;
       top: -32px !important;
       left: var(--menus-left, 360px) !important;
@@ -25,57 +30,100 @@
       margin: 0 !important;
       z-index: 10;
     }
-    #docs-menubar { margin-left: 0 !important; }
-
-    /* Shrink the logo and right-hand buttons to fit the shorter header */
-    #docs-branding-container { transform: scale(0.6); transform-origin: top left; }
-    .docs-titlebar-buttons { height: 38px !important; transform: scale(0.8); transform-origin: right center; }
+    html.wc-compact #docs-menubar { margin-left: 0 !important; }
+    html.wc-compact #docs-branding-container { transform: scale(0.6); transform-origin: top left; }
+    html.wc-compact .docs-titlebar-buttons { height: 38px !important; transform: scale(0.8); transform-origin: right center; }
   `;
   (document.head || document.documentElement).appendChild(style);
+  document.documentElement.classList.add('wc-compact');
 
-  const header = () => document.getElementById('docs-header');
-  const menusShown = () => { const h = header(); return !!h && h.offsetHeight > 0; };
+  const $ = s => document.querySelector(s);
+  const menusShown = () => { const h = $('#docs-header'); return !!h && h.offsetHeight > 0; };
 
+  // Positive = empty gap under the editor; negative = editor runs past the window.
   const gapNow = () => {
-    const ed = document.getElementById('docs-editor-container');
+    const ed = $('#docs-editor-container');
     return ed ? Math.round(window.innerHeight - ed.getBoundingClientRect().bottom) : 0;
   };
 
-  // Send Ctrl+Shift+F ("Hide menus") to whatever currently has keyboard focus
+  // ---------- Re-layout ----------
+  // Google sizes the editor with JavaScript and doesn't notice when the header
+  // changes height. Toggling the built-in "Hide menus" (Ctrl+Shift+F) off and
+  // back on makes it measure again.
+  // The shortcut only registers when the editor's own keyboard target has focus:
+  // a hidden text box inside an iframe in Docs/Slides, the cell input in Sheets.
+  const keyTarget = () => {
+    const ifr = $('.docs-texteventtarget-iframe');
+    return ifr?.contentDocument?.querySelector('[contenteditable="true"]') || $('.cell-input') || document.body;
+  };
+  // Don't steal focus while you're typing in a field such as the title box or a dialog.
+  const userIsTyping = () => {
+    const a = document.activeElement;
+    return !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' ||
+      (a.isContentEditable && !a.classList.contains('cell-input')));
+  };
   const press = () => {
-    const ifr = document.querySelector('.docs-texteventtarget-iframe');
-    const t = ifr?.contentDocument?.activeElement || ifr?.contentDocument?.body || document.activeElement || document.body;
+    const t = keyTarget();
+    t.focus({ preventScroll: true });
     ['keydown', 'keyup'].forEach(type =>
       t.dispatchEvent(new KeyboardEvent(type, {
         key: 'F', code: 'KeyF', keyCode: 70, which: 70,
         ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true
       })));
   };
-
-  // Toggle "Hide menus" off and back on so Slides re-measures the header.
-  // Safety net: if the menus end up hidden afterwards, show them again.
   const relayout = () => {
     press();
     setTimeout(press, 400);
+    // Safety net: if the menus ended up hidden, show them again.
     setTimeout(() => { if (!menusShown()) press(); }, 1500);
+  };
+
+  // ---------- Fit check ----------
+  // Is there room for the menus between the title icons and the right-hand buttons?
+  const fitsOnTitleRow = (compactNow) => {
+    const badges = $('.docs-titlebar-badges');
+    const menubar = $('#docs-menubar');
+    const buttons = $('.docs-titlebar-buttons');
+    if (!badges || !menubar || !buttons) return compactNow;
+    const firstBtn = [...buttons.children].find(c => c.getBoundingClientRect().width > 0) || buttons;
+    let rightLimit = firstBtn.getBoundingClientRect().left;
+    // When not compact the buttons are drawn larger; estimate their compact position.
+    if (!compactNow) rightLimit = window.innerWidth - (window.innerWidth - rightLimit) * 0.8;
+    const room = rightLimit - (badges.getBoundingClientRect().right + 8) - 12;
+    const need = menubar.getBoundingClientRect().width;
+    // A little hysteresis so it doesn't flip back and forth at the edge.
+    return compactNow ? room >= need : room >= need + 24;
   };
 
   let last = 0, tries = 0, nudgeClicked = false;
   setInterval(() => {
-    // Keep the menus just right of the title, even after a rename
-    const badges = document.querySelector('.docs-titlebar-badges');
+    const root = document.documentElement;
+    const badges = $('.docs-titlebar-badges');
     if (badges) {
-      document.documentElement.style.setProperty(
-        '--menus-left', Math.round(badges.getBoundingClientRect().right + 8) + 'px');
+      root.style.setProperty('--menus-left', Math.round(badges.getBoundingClientRect().right + 8) + 'px');
     }
 
-    // If there's a gap at the bottom: first dismiss any nudge, otherwise force a re-layout
-    if (gapNow() < 3) { tries = 0; nudgeClicked = false; return; }
-    if (Date.now() - last < 2500 || tries >= 3) return;
+    // Switch between one-row and two-row headers as the window width changes.
+    if (menusShown()) {
+      const compactNow = root.classList.contains('wc-compact');
+      const shouldBe = fitsOnTitleRow(compactNow);
+      if (shouldBe !== compactNow) {
+        root.classList.toggle('wc-compact', shouldBe);
+        tries = 0;
+        last = 0;
+      }
+    }
+
+    const gap = gapNow();
+    if (Math.abs(gap) < 3) { tries = 0; nudgeClicked = false; return; }
+    if (Date.now() - last < 2500 || tries >= 3 || userIsTyping()) return;
     last = Date.now();
     tries++;
+    // Slides reserves space for the Gemini nudge even while it's hidden.
+    // Clicking the nudge's own close (X) button makes Slides give it back.
     const xs = document.querySelectorAll('.appsElementsGenerativeAiNudgeButtonNudgeDismissButton');
-    if (!nudgeClicked && xs.length) { xs.forEach(b => b.click()); nudgeClicked = true; }
-    else if (menusShown()) relayout();   // menus hidden by you: leave them alone
+    if (gap > 0 && !nudgeClicked && xs.length) { xs.forEach(b => b.click()); nudgeClicked = true; return; }
+    if (menusShown()) relayout();   // menus hidden by you: leave them alone
   }, 500);
 })();
+}
